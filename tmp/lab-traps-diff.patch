@@ -1,0 +1,370 @@
+diff --git a/Makefile b/Makefile
+index a5ab617..dccc7f5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,6 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_alarmtest
+ 
+ 
+ 
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..bccea9d
+--- /dev/null
++++ b/answers-traps.txt
+@@ -0,0 +1,33 @@
++SHORT ANSWER QUESTION: Which registers contain arguments to functions? For example, which register holds 13 in main’s call to printf?
++a0, a1, a2, a3, a4, a5, a6, a7. in main, a2 holds 13
++
++
++SHORT ANSWER QUESTION: Where is the call to function f in the assembly code for main? Where is the call to g? (Hint: the compiler may inline functions.)
++the call to f in main is   printf("%d %d\n", f(8)+1, 13);, and the call to g is inside of f   return g(x);
++
++
++SHORT ANSWER QUESTION: At what address is the function printf located?
++it's at 640
++  3c:	608080e7          	jalr	1544(ra) # --640-- <printf>
++...
++  printf(const char *fmt, ...)
++{
++ --640--:	711d                	addi	sp,sp,-96
++
++SHORT ANSWER QUESTION: What value is in the register ra just after the jalr to printf in main?
++40
++
++
++SHORT ANSWER QUESTION: Run the following code.
++    unsigned int i = 0x00646c72;
++    printf("H%x Wo%s", 57616, &i);
++What is the output? Here Links to an external site. is an ASCII table that maps bytes to characters.
++The output depends on that fact that the RISC-V is little-endian. If the RISC-V were instead big-endian what would you set i to in order to yield the same output? Would you need to change 57616 to a different value?
++HereLinks to an external site. is a description of little- and big-endian and a more whimsical descriptionLinks to an external site..
++
++He110 World
++If it were big endian, i would need to be set in reverse (pairwise) so, 726c6400. 57616 could stay the same 
++
++SHORT ANSWER QUESTION: In the following code, what is going to be printed after y=? (note: the answer is not a specific value) Why does this happen?
++    printf("x=%d y=%d", 3);
++it will print out whatever is next in memory, because, even if printf is not given enough arguments, it will try to read out however many arguments the string formatting says there are
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..92b4453 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+@@ -183,4 +184,4 @@ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+-#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+\ No newline at end of file
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..badce20 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -132,3 +132,24 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++void
++backtrace(void)
++{
++    uint64 fp = r_fp();  // current frame pointer
++    printf("backtrace:\n");
++
++    // find stack boundaries
++    uint64 stack_top = PGROUNDUP(fp);
++    uint64 stack_bottom = PGROUNDDOWN(fp);
++
++    while (fp >= stack_bottom && fp < stack_top) {
++        uint64 ra = *((uint64 *)(fp - 8));  // return address is at fp - 8
++        printf("%p\n", ra);
++
++        uint64 next_fp = *((uint64 *)(fp - 16));  // saved previous frame pointer is at fp - 16
++        if (next_fp == 0 || next_fp <= fp)  // invalid next frame
++            break;
++        fp = next_fp;
++    }
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..d870ace 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -127,6 +127,18 @@ found:
+     return 0;
+   }
+ 
++  // Allocate space for the alarm state (alarm_ticks, alarm_handler, alarm_active).
++  p->alarm_ticks = 0;         // No alarm set initially
++  p->alarm_handler = 0;    // No alarm handler set
++  p->alarm_state = 0;
++  p->alarm_ticks_max = 0;
++
++  if ((p->backup_tf = (struct trapframe *)kalloc()) == 0) {
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -153,6 +165,16 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++
++  // Clean up alarm-related fields
++  p->alarm_handler = 0;
++  p->alarm_ticks = 0;
++  p->alarm_ticks_max = 0;
++  p->alarm_state = INACTIVE;
++  if(p->backup_tf)
++    kfree((void*)p->backup_tf);
++  p->backup_tf = 0;
++
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -654,3 +676,4 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..aec33c3 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -81,6 +81,7 @@ struct trapframe {
+ };
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++enum alarmstate { INACTIVE, ACTIVE, EXECUTING };
+ 
+ // Per-process state
+ struct proc {
+@@ -105,4 +106,11 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  int alarm_ticks_max;
++  int alarm_ticks;          // Number of ticks remaining for the alarm
++  uint64 alarm_handler;
++  struct trapframe *backup_tf;
++  enum alarmstate alarm_state;              // 0 = inactive, 1 = active, 2 = executing
++
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..1e594d3 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -331,6 +331,13 @@ sfence_vma()
+   asm volatile("sfence.vma zero, zero");
+ }
+ 
++static inline uint64
++r_fp()
++{
++    uint64 x;
++    asm volatile("mv %0, s0" : "=r" (x) );
++    return x;
++}
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..3ed8722 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,9 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
++
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +130,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm] sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..67ca3a4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm 22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..9d1d2c1 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -55,6 +55,8 @@ sys_sbrk(void)
+ uint64
+ sys_sleep(void)
+ {
++  backtrace();
++  
+   int n;
+   uint ticks0;
+ 
+@@ -95,3 +97,48 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++uint64 sys_sigalarm(void)
++{
++  int ticks;
++  uint64 handler;
++  if (argint(0, &ticks) < 0 || argaddr(1, &handler) < 0)
++    return -1;
++
++  struct proc *p = myproc();
++
++  acquire(&p->lock);
++
++  if (ticks == 0) {
++    p->alarm_handler = 0;
++    p->alarm_ticks = 0;
++    p->alarm_ticks_max = 0;
++    p->alarm_state = INACTIVE;
++  } else {
++    p->alarm_handler = handler;
++    p->alarm_ticks = ticks;
++    p->alarm_ticks_max = ticks;
++    p->alarm_state = ACTIVE;
++  }
++
++  release(&p->lock);
++
++  return 0;  // Success
++}
++
++uint64 sys_sigreturn(void)
++{
++    struct proc *p = myproc();
++
++    acquire(&p->lock);
++    if (p->backup_tf != 0) {
++        memmove(p->trapframe, p->backup_tf, sizeof(struct trapframe));
++    }
++
++    p->alarm_state = ACTIVE;
++
++    release(&p->lock);
++
++    return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..ee3db59 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -52,7 +52,6 @@ usertrap(void)
+   
+   if(r_scause() == 8){
+     // system call
+-
+     if(p->killed)
+       exit(-1);
+ 
+@@ -76,10 +75,26 @@ usertrap(void)
+   if(p->killed)
+     exit(-1);
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  // Handle the timer interrupt and alarm functionality.
++  if(which_dev == 2) {
++    // Check if the process has an active alarm
++    if(p->alarm_state == ACTIVE && p->alarm_ticks > 0) {
++      p->alarm_ticks--;  // Decrease the tick count
++
++      // Check if it's time to trigger the alarm
++      if(p->alarm_ticks == 0) {
++        memmove(p->backup_tf, p->trapframe, sizeof(struct trapframe));
++        p->alarm_state = EXECUTING;
++        p->alarm_ticks = p->alarm_ticks_max;
++        p->trapframe->epc = p->alarm_handler;
++      }
++    }
++
++    // Yield the CPU (switch processes)
+     yield();
++  }
+ 
++  // Return to user space after handling the interrupt
+   usertrapret();
+ }
+ 
+@@ -217,4 +232,3 @@ devintr()
+     return 0;
+   }
+ }
+-
+diff --git a/user/sh.c b/user/sh.c
+index 83dd513..7106fe0 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -54,7 +54,7 @@ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
+ // Execute cmd.  Never returns.
+-void
++void __attribute__((noreturn))
+ runcmd(struct cmd *cmd)
+ {
+   int p[2];
+diff --git a/user/user.h b/user/user.h
+index b71ecda..5d59fb3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,9 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+@@ -40,3 +43,4 @@ void free(void*);
+ int atoi(const char*);
+ int memcmp(const void *, const void *, uint);
+ void *memcpy(void *, const void *, uint);
++
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fa548b0 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
