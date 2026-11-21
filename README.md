@@ -36,7 +36,7 @@ sudo apt-get install git build-essential qemu-system-misc gcc-riscv64-linux-gnu 
 Lastly clone this repository, change directory into it, and run QEMU.
 
 ```bash
-git clone https://github.com/silasmhd/xv6Traps
+git clone https://github.com/silasmhd/xv6Traps.git
 
 cd xv6Traps
 
